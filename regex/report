@@ -1,0 +1,506 @@
+"""
+regex_report.py
+===============
+
+Restitution métier des résultats de `invoice_regex_miner`.
+
+Transforme le portefeuille de regex en un tableau présentable :
+chaque règle est traduite en langage clair, illustrée par de vrais libellés,
+chiffrée en volume et en taux d'erreur attendu, et assortie d'une recommandation.
+
+    from invoice_regex_miner import RegexDiscoveryPipeline, PipelineConfig
+    from regex_report import top_regex_table, export_top_regex_excel
+
+    result = RegexDiscoveryPipeline(PipelineConfig()).run(df_regex)
+    table = top_regex_table(result, df_regex, top_n=10)
+    export_top_regex_excel(result, df_regex, "top_regex.xlsx", top_n=10)
+"""
+
+from __future__ import annotations
+
+import re
+from typing import Optional
+
+import pandas as pd
+
+from invoice_regex_miner import (
+    COL_CONTRACT_ID,
+    COL_PAYMENT_LABEL,
+    RegexDiscoveryResult,
+    compile_regex,
+    extract_matches,
+)
+
+# =============================================================================
+# 1. SEUILS DE RECOMMANDATION (à ajuster avec le métier)
+# =============================================================================
+
+PRECISION_AUTO = 0.99      # au-dessus : rapprochement automatique sans contrôle
+PRECISION_REVIEW = 0.95    # entre les deux : automatique avec contrôle a posteriori
+MIN_PAYMENTS_TO_SHIP = 10  # en dessous : volume trop faible pour être industrialisé
+
+STATUS_AUTO = "Activer en automatique"
+STATUS_REVIEW = "Activer avec contrôle"
+STATUS_PILOT = "Tester sur un échantillon"
+STATUS_DROP = "Ne pas activer"
+
+# =============================================================================
+# 2. TRADUCTION D'UNE REGEX EN LANGAGE CLAIR
+# =============================================================================
+
+_UNIT_LABELS = {
+    r"\d": ("chiffre", "chiffres"),
+    "[A-Z]": ("lettre majuscule", "lettres majuscules"),
+    "[a-z]": ("lettre minuscule", "lettres minuscules"),
+    "[A-Za-z]": ("lettre", "lettres"),
+    r"\w": ("caractère", "caractères"),
+}
+
+_SYMBOL_LABELS = {
+    "-": "un tiret", "/": "une barre oblique", ".": "un point",
+    "_": "un underscore", " ": "un espace", "#": "un dièse",
+}
+
+# Sous-motifs reconnus dans le corps d'une regex
+_TOKEN = re.compile(
+    r"""
+    (?P<klass>\\d|\[A-Za-z\]|\[A-Z\]|\[a-z\]|\\w)(?P<quant>\{\d+(?:,\d+)?\}|\+|\*|\?)?
+  | \(\?i:(?P<alt>[^)]+)\)                       # préfixe insensible à la casse
+  | \(\?:(?P<group>[^)]+)\)(?P<gquant>\{\d+(?:,\d+)?\}|\+|\*|\?)?
+  | \[(?P<charset>[^\]]+)\](?P<cquant>\{\d+(?:,\d+)?\}|\+|\*|\?)?
+  | \\(?P<escaped>.)
+  | (?P<literal>[^\\\[\](){}?:|]+)
+    """,
+    re.VERBOSE,
+)
+
+
+def _quantifier_text(quant: Optional[str], singular: str, plural: str) -> str:
+    if quant in (None, ""):
+        return f"1 {singular}"
+    if quant == "+":
+        return f"1 ou plusieurs {plural}"
+    if quant == "*":
+        return f"0 ou plusieurs {plural}"
+    if quant == "?":
+        return f"0 ou 1 {singular}"
+    body = quant.strip("{}")
+    if "," in body:
+        lo, hi = body.split(",")
+        return f"{lo} à {hi} {plural}"
+    n = int(body)
+    return f"{n} {singular if n == 1 else plural}"
+
+
+def _describe_body(body: str) -> str:
+    """Décrit la structure capturée : '2 lettres majuscules + 9 chiffres'."""
+    parts: list[str] = []
+    pos = 0
+    while pos < len(body):
+        m = _TOKEN.match(body, pos)
+        if not m:
+            pos += 1
+            continue
+        pos = m.end()
+        if m.group("klass"):
+            sing, plur = _UNIT_LABELS.get(m.group("klass"), ("caractère", "caractères"))
+            parts.append(_quantifier_text(m.group("quant"), sing, plur))
+        elif m.group("group"):
+            options = [o for o in m.group("group").split("|") if o]
+            if all(re.fullmatch(r"[A-Za-z0-9]+", o) for o in options) and options:
+                joined = " ou ".join(f"« {o} »" for o in options)
+                parts.append(joined)
+            else:
+                parts.append("un bloc variable")
+        elif m.group("charset"):
+            parts.append(_quantifier_text(m.group("cquant"), "séparateur", "séparateurs"))
+        elif m.group("escaped"):
+            ch = m.group("escaped")
+            if ch in _SYMBOL_LABELS:
+                parts.append(_SYMBOL_LABELS[ch])
+        elif m.group("literal"):
+            lit = m.group("literal")
+            if lit in _SYMBOL_LABELS:
+                parts.append(_SYMBOL_LABELS[lit])
+            elif lit.strip():
+                parts.append(f"« {lit.strip()} »")
+    return " + ".join(parts) if parts else "structure libre"
+
+
+_LOOKAROUND = re.compile(r"\(\?<?[=!]\[?[^)]*\)")
+
+
+def _capture_body(pattern: str) -> str:
+    """Extrait le contenu du groupe (?P<num>...) en respectant les parenthèses imbriquées."""
+    anchor = pattern.find("(?P<num>")
+    if anchor < 0:
+        return pattern
+    start = anchor + len("(?P<num>")
+    depth, i = 1, start
+    while i < len(pattern):
+        ch = pattern[i]
+        if ch == "\\":
+            i += 2
+            continue
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return pattern[start:i]
+        i += 1
+    return pattern[start:]
+
+
+def describe_regex(pattern: str) -> str:
+    """Traduit une regex en une phrase compréhensible par un non-technicien."""
+    prefix = ""
+    m = re.search(r"\(\?i:([^)]+)\)", pattern)
+    if m:
+        options = [o for o in m.group(1).split("|") if o]
+        readable = " ou ".join(f"« {o.upper()} »" for o in options)
+        prefix = f", précédé du mot {readable}"
+
+    body = _capture_body(pattern)
+    body = _LOOKAROUND.sub("", body)
+    return _describe_body(body) + prefix
+
+
+# =============================================================================
+# 3. EXEMPLES RÉELS TIRÉS DES DONNÉES
+# =============================================================================
+
+
+def examples_for_pattern(
+    pattern: str, df: pd.DataFrame, cfg, n: int = 2, highlight: bool = True
+) -> list[tuple[str, str]]:
+    """Retourne jusqu'à n couples (libellé, numéro extrait) issus des vraies données."""
+    compiled = compile_regex(pattern, cfg)
+    if compiled is None:
+        return []
+    labels = df[COL_PAYMENT_LABEL].dropna().astype(str).drop_duplicates()
+
+    def _render(label: str, found: list[str]) -> tuple[str, str]:
+        shown = label
+        if highlight:
+            for val in dict.fromkeys(found):
+                shown = shown.replace(val, f"【{val}】")
+        return shown, ", ".join(dict.fromkeys(found))
+
+    primary: list[tuple[str, str]] = []   # une par forme de libellé (le plus parlant)
+    backup: list[tuple[str, str]] = []    # même forme, autre numéro : sert de complément
+    seen_shapes: set[str] = set()
+    for label in labels:
+        found = extract_matches(compiled, label, cfg)
+        if not found:
+            continue
+        shape = re.sub(r"\d", "0", label.upper())[:40]
+        if shape not in seen_shapes:
+            seen_shapes.add(shape)
+            primary.append(_render(label, found))
+            if len(primary) >= n:
+                break
+        elif len(backup) < n:
+            backup.append(_render(label, found))
+    return (primary + backup)[:n]
+
+
+# =============================================================================
+# 4. TABLEAU DE RESTITUTION
+# =============================================================================
+
+
+def _status(precision: float, payments: int) -> str:
+    if payments < MIN_PAYMENTS_TO_SHIP:
+        return STATUS_PILOT
+    if precision >= PRECISION_AUTO:
+        return STATUS_AUTO
+    if precision >= PRECISION_REVIEW:
+        return STATUS_REVIEW
+    return STATUS_DROP
+
+
+def top_regex_table(
+    result: RegexDiscoveryResult,
+    df: pd.DataFrame,
+    top_n: int = 10,
+    source: str = "portfolio",
+) -> pd.DataFrame:
+    """Tableau prêt à présenter.
+
+    source="portfolio" : les regex retenues par la sélection gloutonne, donc sans
+        redondance entre elles (recommandé pour une présentation).
+    source="global" : le classement brut par volume couvert, qui contient des
+        variantes proches d'un même format (utile pour un arbitrage technique).
+    """
+    g = result.global_df
+    if g is None or not len(g):
+        return pd.DataFrame()
+
+    if source == "portfolio" and len(result.portfolio_df):
+        ordered = result.portfolio_df["pattern"].tolist()
+        base = g.set_index("pattern").loc[[p for p in ordered if p in g["pattern"].values]]
+        base = base.reset_index()
+    else:
+        base = g.sort_values(["payments_hit", "precision"], ascending=False)
+
+    base = base.head(top_n)
+    total_payments = result.dataset_stats.get("n_payments", 0) or 1
+    n_contracts_total = result.dataset_stats.get("n_contracts", 0) or 1
+
+    rows = []
+    for rank, r in enumerate(base.itertuples(index=False), start=1):
+        ex = examples_for_pattern(r.pattern, df, result.cfg, n=2)
+        precision = float(r.precision)
+        # r.payments_hit est compté sur l'échantillon d'évaluation ; on repasse par
+        # le taux de couverture pour exprimer un volume à l'échelle du portefeuille.
+        payments = int(round(float(r.coverage) * total_payments))
+        rows.append(
+            {
+                "Rang": rank,
+                "Format de numéro reconnu": describe_regex(r.pattern),
+                "Exemple de libellé": ex[0][0] if ex else "",
+                "Numéro extrait": ex[0][1] if ex else "",
+                "Autre exemple": ex[1][0] if len(ex) > 1 else "",
+                "Paiements couverts": payments,
+                "% du volume": round(100 * payments / total_payments, 1),
+                "Fiabilité": round(100 * precision, 1),
+                "Erreurs attendues / 100": round(100 * (1 - precision), 1),
+                "Contrats concernés": int(r.n_contracts_validated),
+                "% des contrats": round(100 * int(r.n_contracts_validated) / n_contracts_total, 1),
+                "Recommandation": _status(precision, payments),
+                "Origine": {"heuristic": "Détection automatique", "llm": "IA",
+                            "llm_refine": "IA (2e passe)", "llm_global": "IA (généralisation)"}
+                .get(r.source, r.source),
+                "Règle technique (regex)": r.pattern,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def coverage_funnel(result: RegexDiscoveryResult) -> pd.DataFrame:
+    """L'entonnoir de volumétrie : ce que le métier regarde en premier."""
+    stats = result.dataset_stats
+    n = stats.get("n_payments", 0)
+    diag = result.diagnostics_df
+    col = "n_payments_locatable" if "n_payments_locatable" in diag.columns else None
+    locatable = int(diag[col].sum()) if (col and len(diag)) else 0
+    # Si l'évaluation globale a été échantillonnée, on ramène la couverture au
+    # volume réel : mélanger un numérateur d'échantillon et un dénominateur total
+    # donnerait un taux d'automatisation faux.
+    coverage_rate = result.portfolio_metrics.get("coverage", 0.0)
+    sampled = bool(result.portfolio_metrics.get("sampled", False))
+    covered = round(coverage_rate * n) if sampled else result.portfolio_metrics.get("payments_covered", 0)
+
+    steps = [
+        ("Paiements analysés", n, ""),
+        ("Paiements dont le numéro figure dans le libellé", locatable,
+         "Plafond théorique : le reste ne sera jamais automatisable en l'état"),
+        ("Numéro extrait par les règles retenues", covered,
+         "Ce que le moteur sait faire aujourd'hui"
+         + (f" (estimé sur un échantillon de {result.portfolio_metrics.get('payments_evaluated', 0):,} "
+            "paiements)".replace(",", " ") if sampled else "")),
+        ("Reste en traitement manuel", max(0, n - covered),
+         "Charge résiduelle"),
+    ]
+    return pd.DataFrame(
+        [
+            {"Étape": s, "Paiements": v,
+             "% du total": round(100 * v / n, 1) if n else 0.0, "Lecture": c}
+            for s, v, c in steps
+        ]
+    )
+
+
+# =============================================================================
+# 5. EXPORT EXCEL
+# =============================================================================
+
+
+def export_top_regex_excel(
+    result: RegexDiscoveryResult,
+    df: pd.DataFrame,
+    path: str,
+    top_n: int = 10,
+    source: str = "portfolio",
+) -> str:
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+    from openpyxl.utils import get_column_letter
+
+    table = top_regex_table(result, df, top_n=top_n, source=source)
+    funnel = coverage_funnel(result)
+
+    FONT = "Arial"
+    header_fill = PatternFill("solid", fgColor="1F3864")
+    header_font = Font(name=FONT, bold=True, color="FFFFFF", size=10)
+    body_font = Font(name=FONT, size=10)
+    mono_font = Font(name="Consolas", size=9)
+    title_font = Font(name=FONT, bold=True, size=14)
+    thin = Side(style="thin", color="BFBFBF")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    fill_ok = PatternFill("solid", fgColor="E2EFDA")
+    fill_warn = PatternFill("solid", fgColor="FFF2CC")
+    fill_ko = PatternFill("solid", fgColor="FCE4E4")
+
+    wb = Workbook()
+
+    # ---------------------------- Onglet 1 : synthèse -----------------------
+    ws = wb.active
+    ws.title = "Synthèse"
+    ws["A1"] = "Réconciliation automatique — synthèse"
+    ws["A1"].font = title_font
+    ws["A3"] = "De combien de paiements parle-t-on ?"
+    ws["A3"].font = Font(name=FONT, bold=True, size=11)
+
+    start = 4
+    for j, col in enumerate(funnel.columns, start=1):
+        c = ws.cell(row=start, column=j, value=col)
+        c.font, c.fill, c.border = header_font, header_fill, border
+    for i, row in enumerate(funnel.itertuples(index=False), start=start + 1):
+        for j, val in enumerate(row, start=1):
+            c = ws.cell(row=i, column=j, value=val)
+            c.font, c.border = body_font, border
+            if j == 2:
+                c.number_format = "#,##0"
+            if j == 3:
+                c.number_format = '0.0"%"'
+        ws.cell(row=i, column=4).alignment = Alignment(wrap_text=True, vertical="top")
+
+    kpi_row = start + len(funnel) + 2
+    ws.cell(row=kpi_row, column=1, value="Indicateurs clés").font = Font(name=FONT, bold=True, size=11)
+    kpis = [
+        ("Contrats analysés", result.dataset_stats.get("n_contracts", 0), "#,##0"),
+        ("Règles retenues", len(table), "#,##0"),
+        ("Taux d'automatisation atteint",
+         result.portfolio_metrics.get("coverage", 0), "0.0%"),
+        ("Plafond théorique (numéro présent dans le libellé)",
+         result.dataset_stats.get("max_achievable_recall", 0), "0.0%"),
+    ]
+    for k, (label, value, fmt) in enumerate(kpis, start=kpi_row + 1):
+        ws.cell(row=k, column=1, value=label).font = body_font
+        c = ws.cell(row=k, column=2, value=value)
+        c.font, c.number_format = Font(name=FONT, bold=True, size=10), fmt
+
+    note = kpi_row + len(kpis) + 2
+    ws.cell(row=note, column=1, value=(
+        "Lecture : l'écart entre « numéro présent dans le libellé » et « paiements analysés » "
+        "ne relève pas du moteur de règles — il s'agit de paiements où le client n'a pas "
+        "mentionné la référence. Seule une action auprès du client peut le réduire."
+    )).font = Font(name=FONT, italic=True, size=9)
+    ws.merge_cells(start_row=note, start_column=1, end_row=note + 1, end_column=4)
+    ws.cell(row=note, column=1).alignment = Alignment(wrap_text=True, vertical="top")
+
+    for col, width in zip("ABCD", (46, 14, 12, 52)):
+        ws.column_dimensions[col].width = width
+    ws.freeze_panes = "A5"
+
+    # ---------------------------- Onglet 2 : top regex ----------------------
+    ws2 = wb.create_sheet("Top règles")
+    ws2["A1"] = f"Top {len(table)} des règles d'extraction"
+    ws2["A1"].font = title_font
+    _note = ("Chaque ligne est une règle indépendante. « Fiabilité » = part des "
+             "extractions correctes ; « Erreurs attendues / 100 » = son complément.")
+    if result.portfolio_metrics.get("sampled"):
+        _note += (" Volumes extrapolés depuis un échantillon de "
+                  f"{result.portfolio_metrics.get('payments_evaluated', 0):,} paiements."
+                  ).replace(",", " ")
+    ws2["A2"] = _note
+    ws2["A2"].font = Font(name=FONT, italic=True, size=9)
+
+    hdr = 4
+    for j, col in enumerate(table.columns, start=1):
+        c = ws2.cell(row=hdr, column=j, value=col)
+        c.font, c.fill, c.border = header_font, header_fill, border
+        c.alignment = Alignment(wrap_text=True, vertical="center", horizontal="center")
+    ws2.row_dimensions[hdr].height = 34
+
+    cols = list(table.columns)
+    idx_pay = cols.index("Paiements couverts") + 1
+    idx_pct = cols.index("% du volume") + 1
+    total_payments = result.dataset_stats.get("n_payments", 0) or 1
+
+    for i, row in enumerate(table.itertuples(index=False), start=hdr + 1):
+        for j, val in enumerate(row, start=1):
+            c = ws2.cell(row=i, column=j, value=val)
+            c.font = mono_font if cols[j - 1] == "Règle technique (regex)" else body_font
+            c.border = border
+            c.alignment = Alignment(wrap_text=True, vertical="top")
+            name = cols[j - 1]
+            if name in ("Paiements couverts", "Contrats concernés"):
+                c.number_format = "#,##0"
+            elif name in ("% du volume", "Fiabilité", "Erreurs attendues / 100", "% des contrats"):
+                c.number_format = '0.0"%"'
+            elif name == "Recommandation":
+                c.fill = {STATUS_AUTO: fill_ok, STATUS_REVIEW: fill_warn,
+                          STATUS_PILOT: fill_warn, STATUS_DROP: fill_ko}.get(val, fill_warn)
+        # % du volume recalculé par formule pour rester vivant
+        ws2.cell(row=i, column=idx_pct).value = (
+            f"=IFERROR({get_column_letter(idx_pay)}{i}/{total_payments}*100,0)"
+        )
+
+    tot = hdr + len(table) + 1
+    ws2.cell(row=tot, column=1, value="TOTAL (avec doublons entre règles)").font = Font(
+        name=FONT, bold=True, size=10)
+    c = ws2.cell(row=tot, column=idx_pay,
+                 value=f"=SUM({get_column_letter(idx_pay)}{hdr+1}:{get_column_letter(idx_pay)}{tot-1})")
+    c.font, c.number_format, c.border = Font(name=FONT, bold=True, size=10), "#,##0", border
+    ws2.cell(row=tot + 1, column=1, value=(
+        f"Paiements distincts réellement couverts par l'ensemble des règles : "
+        f"{result.portfolio_metrics.get('payments_covered', 0):,} "
+        f"({result.portfolio_metrics.get('coverage', 0)*100:.1f} % du volume). "
+        "Ce total est inférieur à la somme ci-dessus car plusieurs règles peuvent "
+        "reconnaître le même paiement."
+    ).replace(",", " ")).font = Font(name=FONT, italic=True, size=9)
+
+    widths = {"Rang": 6, "Format de numéro reconnu": 34, "Exemple de libellé": 42,
+              "Numéro extrait": 16, "Autre exemple": 42, "Paiements couverts": 12,
+              "% du volume": 11, "Fiabilité": 10, "Erreurs attendues / 100": 12,
+              "Contrats concernés": 11, "% des contrats": 11, "Recommandation": 22,
+              "Origine": 18, "Règle technique (regex)": 52}
+    for j, col in enumerate(cols, start=1):
+        ws2.column_dimensions[get_column_letter(j)].width = widths.get(col, 16)
+    ws2.freeze_panes = f"A{hdr+1}"
+
+    # ---------------------------- Onglet 3 : par contrat --------------------
+    ws3 = wb.create_sheet("Par contrat")
+    diag = result.diagnostics_df.rename(columns={
+        COL_CONTRACT_ID: "Contrat", "n_payments": "Paiements",
+        "n_invoice_links": "Factures liées", "n_locatable": "Numéros présents dans le libellé",
+        "n_payments_locatable": "Paiements exploitables (nb)",
+        "max_recall": "Plafond d'automatisation", "max_payment_coverage": "Paiements exploitables (%)",
+    })
+    for j, col in enumerate(diag.columns, start=1):
+        c = ws3.cell(row=1, column=j, value=col)
+        c.font, c.fill, c.border = header_font, header_fill, border
+        c.alignment = Alignment(wrap_text=True, vertical="center", horizontal="center")
+    ws3.row_dimensions[1].height = 30
+    for i, row in enumerate(diag.itertuples(index=False), start=2):
+        for j, val in enumerate(row, start=1):
+            c = ws3.cell(row=i, column=j, value=val)
+            c.font, c.border = body_font, border
+            if diag.columns[j - 1] in ("Plafond d'automatisation", "Paiements exploitables (%)"):
+                c.number_format = "0.0%"
+                if isinstance(val, (int, float)) and val < 0.5:
+                    c.fill = fill_ko
+            elif j > 1:
+                c.number_format = "#,##0"
+    for j, col in enumerate(diag.columns, start=1):
+        ws3.column_dimensions[get_column_letter(j)].width = 22 if j > 1 else 26
+    ws3.freeze_panes = "A2"
+
+    wb.save(path)
+    return path
+
+
+if __name__ == "__main__":
+    from invoice_regex_miner import PipelineConfig, RegexDiscoveryPipeline, _demo_dataframe
+
+    df_demo = _demo_dataframe()
+    res = RegexDiscoveryPipeline(PipelineConfig(verbose=False)).run(df_demo)
+    print(coverage_funnel(res).to_string(index=False))
+    print()
+    t = top_regex_table(res, df_demo, top_n=10)
+    print(t[["Rang", "Format de numéro reconnu", "Exemple de libellé",
+             "Paiements couverts", "Fiabilité", "Recommandation"]].to_string(index=False))
+    export_top_regex_excel(res, df_demo, "top_regex.xlsx", top_n=10)
