@@ -95,27 +95,81 @@ def extract_prefix_token(text_libelle: str, invoice_id: str):
     return token, separator
 
 
+def _skeleton(invoice_id: str) -> tuple:
+    """
+    Decoupe un identifiant en segments typés : suites de chiffres (D),
+    suites de lettres (L), caracteres speciaux isoles (tels quels).
+    Ex: "2024-AB-001" -> (('D',4), ('-',1), ('L',2), ('-',1), ('D',3))
+    """
+    segments = []
+    current_type = None
+    current_len = 0
+    for ch in invoice_id:
+        ch_type = "D" if ch.isdigit() else ("L" if ch.isalpha() else ch)
+        if ch_type == current_type and ch_type in ("D", "L"):
+            current_len += 1
+        else:
+            if current_type is not None:
+                segments.append((current_type, current_len))
+            current_type = ch_type
+            current_len = 1
+    if current_type is not None:
+        segments.append((current_type, current_len))
+    return tuple(segments)
+
+
+def _shape(skeleton: tuple) -> tuple:
+    """Sequence de types uniquement (D/L/caractere), sans les longueurs."""
+    return tuple(seg[0] for seg in skeleton)
+
+
+def _shape_to_regex(skeletons_with_same_shape: list) -> str:
+    """
+    Construit une regex pour un groupe d'identifiants qui partagent la
+    meme sequence de types (ex D-L-D). La longueur de chaque segment
+    est bornee entre le min et le max observes pour ce segment, ce qui
+    reste precis tout en tolerant une legere variation de longueur.
+    """
+    n_segments = len(skeletons_with_same_shape[0])
+    parts = []
+    for pos in range(n_segments):
+        seg_type = skeletons_with_same_shape[0][pos][0]
+        lengths = {sk[pos][1] for sk in skeletons_with_same_shape}
+
+        if seg_type == "D":
+            quant = f"{{{min(lengths)}}}" if len(lengths) == 1 else f"{{{min(lengths)},{max(lengths)}}}"
+            parts.append(rf"\d{quant}")
+        elif seg_type == "L":
+            quant = f"{{{min(lengths)}}}" if len(lengths) == 1 else f"{{{min(lengths)},{max(lengths)}}}"
+            parts.append(rf"[A-Za-z]{quant}")
+        else:
+            parts.append(re.escape(seg_type * min(lengths)))  # caractere special, longueur fixe
+
+    return "".join(parts)
+
+
 def build_number_pattern(invoice_ids: list) -> str:
     """
-    Construit un pattern regex pour le numero de facture d'un cluster,
-    a partir des formats reellement observes (digits / alnum / longueur).
+    Construit un pattern regex pour le numero de facture d'un cluster.
+    Chaque numero est decoupe en segments types (chiffres / lettres /
+    caracteres speciaux) : ca gere nativement les numeros contenant des
+    lettres (ex "AB123456") au lieu de les faire tomber dans un fallback
+    generique non borne, source de sur-matching et de faux KO.
+    Si plusieurs formats distincts coexistent dans le cluster (avec ou
+    sans lettres, structures differentes), ils sont combines par
+    alternance, chacun avec ses propres bornes de longueur.
     """
-    all_digits = all(i.isdigit() for i in invoice_ids)
-    lengths = {len(i) for i in invoice_ids}
+    skeletons = [_skeleton(i) for i in invoice_ids]
 
-    if all_digits:
-        if len(lengths) == 1:
-            return rf"\d{{{lengths.pop()}}}"
-        return rf"\d{{{min(lengths)},{max(lengths)}}}"
+    by_shape = defaultdict(list)
+    for sk in skeletons:
+        by_shape[_shape(sk)].append(sk)
 
-    all_alnum = all(i.isalnum() for i in invoice_ids)
-    if all_alnum:
-        if len(lengths) == 1:
-            return rf"[A-Za-z0-9]{{{lengths.pop()}}}"
-        return rf"[A-Za-z0-9]{{{min(lengths)},{max(lengths)}}}"
+    patterns = [_shape_to_regex(sks) for sks in by_shape.values()]
 
-    # cas general : ponctuation interne (ex "2024-001") -> classe large
-    return r"[A-Za-z0-9\-_/\.]+"
+    if len(patterns) == 1:
+        return patterns[0]
+    return "(?:" + "|".join(patterns) + ")"
 
 
 def _clean_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -230,6 +284,41 @@ def build_contract_regex(invoice_ids_for_contract: list) -> Optional[str]:
     return rf"(?P<invoice>{pattern})"
 
 
+def export_rules(rules: list) -> list:
+    """
+    Serialise les regles validees pour stockage externe (JSON, table de
+    config, etc.). On ne garde que la chaine de la regex, pas l'objet
+    compile qui ne se serialise pas tel quel.
+    """
+    return [
+        {
+            "token": r.token,
+            "regex": r.to_regex_string(),
+            "n_obs": r.n_obs,
+            "coverage": r.coverage,
+            "precision": r.precision,
+        }
+        for r in rules
+    ]
+
+
+def load_rules(serialized: list) -> list:
+    """
+    Recharge des regles precedemment exportees (deja auditees/filtrees),
+    pretes a l'emploi avec apply_rules() sans relancer tout le pipeline
+    de generation sur l'historique.
+    """
+    rules = []
+    for item in serialized:
+        rule = ClusterRule(token=item["token"], separators=set(), number_pattern="")
+        rule.regex = re.compile(item["regex"])
+        rule.n_obs = item["n_obs"]
+        rule.coverage = item["coverage"]
+        rule.precision = item["precision"]
+        rules.append(rule)
+    return rules
+
+
 def rules_summary(rules: list) -> pd.DataFrame:
     """Tableau recapitulatif des regles generees, pour audit humain."""
     return pd.DataFrame([
@@ -247,12 +336,14 @@ def rules_summary(rules: list) -> pd.DataFrame:
 if __name__ == "__main__":
     # Exemple d'utilisation sur un petit jeu de donnees
     df = pd.DataFrame({
-        "invoice_id": ["123456", "789012", "445566", "998877"],
+        "invoice_id": ["123456", "789012", "445566", "998877", "AB12345", "2024-001"],
         "text_libelle": [
             "PAIEMENT INV/123456 CLIENT DUPONT",
             "REGLEMENT INV 789012",
             "VIR FAC-445566 SEPT",
             "AUTRE LIBELLE 998877 SANS PREFIXE",
+            "PAIEMENT INV/AB12345 CLIENT MARTIN",
+            "VIR FAC-2024-001 OCT",
         ],
     })
 
@@ -260,7 +351,14 @@ if __name__ == "__main__":
     print(rules_summary(rules))
     print()
 
+    # Export -> reload, pour verifier que le cycle persistance fonctionne
+    import json
+    serialized = export_rules(rules)
+    print("Export JSON:", json.dumps(serialized, indent=2, ensure_ascii=False)[:200], "...")
+    reloaded_rules = load_rules(serialized)
+    print()
+
     for _, row in df.iterrows():
-        found = apply_rules(row["text_libelle"], rules)
+        found = apply_rules(row["text_libelle"], reloaded_rules)
         status = "OK" if found == row["invoice_id"] else "KO"
         print(f"[{status}] {row['text_libelle']!r} -> {found} (attendu {row['invoice_id']})")
