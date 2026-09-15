@@ -1,0 +1,257 @@
+"""
+Generation automatique de regex pour la detection de numeros de facture
+dans des libelles de paiement.
+
+Entree : DataFrame avec colonnes 'invoice_id' (str) et 'text_libelle' (str)
+Sortie : liste de regles regex globales, triees par precision puis couverture,
+         avec leurs metriques de validation (coverage / precision).
+
+Principe :
+1. Pour chaque ligne, on cherche invoice_id dans text_libelle et on isole
+   le token alphabetique + le separateur qui le precedent (ex: "INV", "/").
+2. On regroupe les lignes par token (cluster).
+3. Pour chaque cluster, on construit une regex : token fixe + classe de
+   separateurs observes (normalises, avec ? si le separateur est optionnel)
+   + pattern du numero (deduit des formats reellement observes).
+4. On valide chaque regle sur tout l'historique (coverage, precision).
+5. On trie par precision puis coverage, et on les applique dans cet ordre :
+   la premiere regle qui matche gagne (equivalent d'un OU priorise).
+"""
+
+import re
+import pandas as pd
+from collections import defaultdict
+from dataclasses import dataclass, field
+from typing import Optional
+
+
+SEPARATOR_CHARS = " \t-_/.:#"   # caracteres consideres comme separateurs
+CONTEXT_WINDOW = 15             # nb de caracteres regardes avant le numero
+
+
+@dataclass
+class ClusterRule:
+    token: str                  # texte fixe qui precede le numero, ex "INV"
+    separators: set             # separateurs observes entre le token et le numero
+    number_pattern: str         # pattern regex du numero pour ce cluster
+    regex: re.Pattern = field(default=None)
+    n_obs: int = 0
+    coverage: float = 0.0
+    precision: float = 0.0
+
+    def to_regex_string(self) -> str:
+        sep_class = build_separator_regex(self.separators)
+        return rf"{re.escape(self.token)}{sep_class}(?P<invoice>{self.number_pattern})"
+
+
+def build_separator_regex(separators: set) -> str:
+    """
+    Construit la classe regex couvrant tous les separateurs observes
+    dans un cluster (espace, slash, tiret, absence de separateur, etc.)
+    """
+    optional = "" in separators
+    real_seps = [s for s in separators if s != ""]
+
+    if not real_seps:
+        # jamais de separateur "reel" observe -> on reste permissif
+        return r"\s*" if optional else ""
+
+    single_chars = {s for s in real_seps if len(s) == 1}
+    multi_chars = [s for s in real_seps if len(s) > 1]
+
+    parts = []
+    if single_chars:
+        escaped = "".join(re.escape(c) for c in sorted(single_chars))
+        parts.append(f"[{escaped}]")
+    for m in multi_chars:
+        parts.append(re.escape(m))
+
+    alt = "|".join(parts) if len(parts) > 1 else parts[0]
+    quant = "?" if optional else ""
+    if len(parts) > 1:
+        return f"(?:{alt}){quant}"
+    return f"{alt}{quant}"
+
+
+def extract_prefix_token(text_libelle: str, invoice_id: str):
+    """
+    Cherche invoice_id dans text_libelle, isole le token alphabetique
+    et le separateur qui le precedent immediatement.
+    Retourne (token, separator), ou (None, None) si invoice_id introuvable,
+    ou ("", "") si le numero n'a aucun token alpha juste avant.
+    """
+    idx = text_libelle.find(invoice_id)
+    if idx == -1:
+        return None, None
+
+    prefix = text_libelle[max(0, idx - CONTEXT_WINDOW):idx]
+
+    m = re.search(r"([A-Za-zÀ-ÿ]+)([%s]*)$" % re.escape(SEPARATOR_CHARS), prefix)
+    if not m:
+        return "", ""
+
+    token = m.group(1).upper()
+    separator = m.group(2)
+    return token, separator
+
+
+def build_number_pattern(invoice_ids: list) -> str:
+    """
+    Construit un pattern regex pour le numero de facture d'un cluster,
+    a partir des formats reellement observes (digits / alnum / longueur).
+    """
+    all_digits = all(i.isdigit() for i in invoice_ids)
+    lengths = {len(i) for i in invoice_ids}
+
+    if all_digits:
+        if len(lengths) == 1:
+            return rf"\d{{{lengths.pop()}}}"
+        return rf"\d{{{min(lengths)},{max(lengths)}}}"
+
+    all_alnum = all(i.isalnum() for i in invoice_ids)
+    if all_alnum:
+        if len(lengths) == 1:
+            return rf"[A-Za-z0-9]{{{lengths.pop()}}}"
+        return rf"[A-Za-z0-9]{{{min(lengths)},{max(lengths)}}}"
+
+    # cas general : ponctuation interne (ex "2024-001") -> classe large
+    return r"[A-Za-z0-9\-_/\.]+"
+
+
+def build_clusters(df: pd.DataFrame) -> dict:
+    """
+    Regroupe les lignes par token fixe (ex INV, FAC, ...) detecte juste
+    avant le numero de facture dans le libelle.
+    """
+    clusters = defaultdict(lambda: {"separators": set(), "invoice_ids": []})
+
+    for _, row in df.iterrows():
+        libelle, inv_id = row["text_libelle"], row["invoice_id"]
+        if pd.isna(libelle) or pd.isna(inv_id):
+            continue
+
+        token, sep = extract_prefix_token(str(libelle), str(inv_id))
+        if token is None:
+            continue  # invoice_id introuvable tel quel dans le libelle
+
+        clusters[token]["separators"].add(sep)
+        clusters[token]["invoice_ids"].append(str(inv_id))
+
+    return clusters
+
+
+def validate_rule(rule: ClusterRule, df: pd.DataFrame) -> ClusterRule:
+    """
+    Teste la regex du cluster sur tout le dataframe et calcule :
+    - coverage  : part de l'historique correctement capturee par la regle
+    - precision : part des matches qui donnent le bon numero (detecte
+                  les faux positifs de la regle sur d'autres lignes)
+    """
+    pattern = re.compile(rule.to_regex_string())
+    n_total = len(df)
+    n_match_attempts = 0
+    n_correct = 0
+
+    for _, row in df.iterrows():
+        libelle, true_id = row["text_libelle"], row["invoice_id"]
+        if pd.isna(libelle) or pd.isna(true_id):
+            continue
+
+        m = pattern.search(str(libelle))
+        if m:
+            n_match_attempts += 1
+            if m.group("invoice") == str(true_id):
+                n_correct += 1
+
+    rule.regex = pattern
+    rule.n_obs = n_match_attempts
+    rule.coverage = n_correct / n_total if n_total else 0.0
+    rule.precision = n_correct / n_match_attempts if n_match_attempts else 0.0
+    return rule
+
+
+def generate_global_rules(df: pd.DataFrame, min_occurrences: int = 3) -> list:
+    """
+    Pipeline complet : clusters -> regex par cluster -> validation ->
+    tri par (precision desc, coverage desc).
+    Les clusters avec trop peu d'occurrences sont ecartes des regles
+    globales (candidats naturels pour des regles par contrat a la place).
+    """
+    clusters = build_clusters(df)
+    rules = []
+
+    for token, data in clusters.items():
+        if len(data["invoice_ids"]) < min_occurrences:
+            continue
+
+        rule = ClusterRule(
+            token=token,
+            separators=data["separators"],
+            number_pattern=build_number_pattern(data["invoice_ids"]),
+        )
+        rules.append(validate_rule(rule, df))
+
+    rules.sort(key=lambda r: (r.precision, r.coverage), reverse=True)
+    return rules
+
+
+def apply_rules(text_libelle: str, rules: list) -> Optional[str]:
+    """
+    Applique les regles dans l'ordre de priorite (precision decroissante)
+    et retourne le premier numero de facture trouve, ou None.
+    """
+    for rule in rules:
+        m = rule.regex.search(text_libelle)
+        if m:
+            return m.group("invoice")
+    return None
+
+
+def build_contract_regex(invoice_ids_for_contract: list) -> Optional[str]:
+    """
+    Regex par contrat : capture uniquement le numero de facture, sans
+    contexte (un seul contrat = moins d'ambiguite). Retourne None s'il
+    n'y a pas d'historique pour ce contrat.
+    A appeler en groupant votre dataframe par colonne contrat, puis en
+    passant la liste des invoice_id de ce groupe.
+    """
+    if not invoice_ids_for_contract:
+        return None
+    pattern = build_number_pattern([str(i) for i in invoice_ids_for_contract])
+    return rf"(?P<invoice>{pattern})"
+
+
+def rules_summary(rules: list) -> pd.DataFrame:
+    """Tableau recapitulatif des regles generees, pour audit humain."""
+    return pd.DataFrame([
+        {
+            "token": r.token if r.token else "(aucun prefixe)",
+            "regex": r.to_regex_string(),
+            "n_obs": r.n_obs,
+            "coverage": round(r.coverage, 4),
+            "precision": round(r.precision, 4),
+        }
+        for r in rules
+    ])
+
+
+if __name__ == "__main__":
+    # Exemple d'utilisation sur un petit jeu de donnees
+    df = pd.DataFrame({
+        "invoice_id": ["123456", "789012", "445566", "998877"],
+        "text_libelle": [
+            "PAIEMENT INV/123456 CLIENT DUPONT",
+            "REGLEMENT INV 789012",
+            "VIR FAC-445566 SEPT",
+            "AUTRE LIBELLE 998877 SANS PREFIXE",
+        ],
+    })
+
+    rules = generate_global_rules(df, min_occurrences=1)
+    print(rules_summary(rules))
+    print()
+
+    for _, row in df.iterrows():
+        found = apply_rules(row["text_libelle"], rules)
+        status = "OK" if found == row["invoice_id"] else "KO"
+        print(f"[{status}] {row['text_libelle']!r} -> {found} (attendu {row['invoice_id']})")
