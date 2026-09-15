@@ -118,52 +118,60 @@ def build_number_pattern(invoice_ids: list) -> str:
     return r"[A-Za-z0-9\-_/\.]+"
 
 
+def _clean_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Nettoyage fait une seule fois pour tout le pipeline : on retire les
+    lignes sans libelle ou sans invoice_id, et on force le typage string.
+    Evite de refaire ce travail (et les checks NaN) a chaque ligne / regle.
+    """
+    clean = df.dropna(subset=["text_libelle", "invoice_id"]).copy()
+    clean["text_libelle"] = clean["text_libelle"].astype(str)
+    clean["invoice_id"] = clean["invoice_id"].astype(str)
+    return clean
+
+
 def build_clusters(df: pd.DataFrame) -> dict:
     """
     Regroupe les lignes par token fixe (ex INV, FAC, ...) detecte juste
     avant le numero de facture dans le libelle.
+
+    Passe unique en O(n), via zip() sur des listes plutot que iterrows()
+    (iterrows reconstruit un objet Series a chaque ligne, ce qui est tres
+    couteux sur de gros volumes).
     """
     clusters = defaultdict(lambda: {"separators": set(), "invoice_ids": []})
 
-    for _, row in df.iterrows():
-        libelle, inv_id = row["text_libelle"], row["invoice_id"]
-        if pd.isna(libelle) or pd.isna(inv_id):
-            continue
-
-        token, sep = extract_prefix_token(str(libelle), str(inv_id))
+    for libelle, inv_id in zip(df["text_libelle"], df["invoice_id"]):
+        token, sep = extract_prefix_token(libelle, inv_id)
         if token is None:
             continue  # invoice_id introuvable tel quel dans le libelle
 
         clusters[token]["separators"].add(sep)
-        clusters[token]["invoice_ids"].append(str(inv_id))
+        clusters[token]["invoice_ids"].append(inv_id)
 
     return clusters
 
 
-def validate_rule(rule: ClusterRule, df: pd.DataFrame) -> ClusterRule:
+def validate_rule(rule: ClusterRule, libelle_col: pd.Series, invoice_col: pd.Series) -> ClusterRule:
     """
-    Teste la regex du cluster sur tout le dataframe et calcule :
+    Teste la regex du cluster sur toute la colonne et calcule :
     - coverage  : part de l'historique correctement capturee par la regle
     - precision : part des matches qui donnent le bon numero (detecte
                   les faux positifs de la regle sur d'autres lignes)
+
+    Vectorise avec str.extract() (boucle C via pandas/re) au lieu d'une
+    boucle Python ligne par ligne : sur plusieurs centaines de milliers
+    de lignes, c'est un facteur 50-100x plus rapide qu'un iterrows().
     """
-    pattern = re.compile(rule.to_regex_string())
-    n_total = len(df)
-    n_match_attempts = 0
-    n_correct = 0
+    pattern_str = rule.to_regex_string()
+    extracted = libelle_col.str.extract(pattern_str, expand=True)["invoice"]
 
-    for _, row in df.iterrows():
-        libelle, true_id = row["text_libelle"], row["invoice_id"]
-        if pd.isna(libelle) or pd.isna(true_id):
-            continue
+    n_total = len(libelle_col)
+    matched_mask = extracted.notna()
+    n_match_attempts = int(matched_mask.sum())
+    n_correct = int((matched_mask & (extracted == invoice_col)).sum())
 
-        m = pattern.search(str(libelle))
-        if m:
-            n_match_attempts += 1
-            if m.group("invoice") == str(true_id):
-                n_correct += 1
-
-    rule.regex = pattern
+    rule.regex = re.compile(pattern_str)
     rule.n_obs = n_match_attempts
     rule.coverage = n_correct / n_total if n_total else 0.0
     rule.precision = n_correct / n_match_attempts if n_match_attempts else 0.0
@@ -172,12 +180,13 @@ def validate_rule(rule: ClusterRule, df: pd.DataFrame) -> ClusterRule:
 
 def generate_global_rules(df: pd.DataFrame, min_occurrences: int = 3) -> list:
     """
-    Pipeline complet : clusters -> regex par cluster -> validation ->
-    tri par (precision desc, coverage desc).
+    Pipeline complet : nettoyage -> clusters -> regex par cluster ->
+    validation vectorisee -> tri par (precision desc, coverage desc).
     Les clusters avec trop peu d'occurrences sont ecartes des regles
     globales (candidats naturels pour des regles par contrat a la place).
     """
-    clusters = build_clusters(df)
+    clean = _clean_columns(df)
+    clusters = build_clusters(clean)
     rules = []
 
     for token, data in clusters.items():
@@ -189,7 +198,7 @@ def generate_global_rules(df: pd.DataFrame, min_occurrences: int = 3) -> list:
             separators=data["separators"],
             number_pattern=build_number_pattern(data["invoice_ids"]),
         )
-        rules.append(validate_rule(rule, df))
+        rules.append(validate_rule(rule, clean["text_libelle"], clean["invoice_id"]))
 
     rules.sort(key=lambda r: (r.precision, r.coverage), reverse=True)
     return rules
