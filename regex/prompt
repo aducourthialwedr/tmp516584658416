@@ -1,0 +1,27 @@
+REGEX_SYSTEM = """Tu écris UNE expression régulière Python qui extrait une référence \
+de facture présente dans un libellé de paiement.
+
+La référence est propre à chaque client et de fait aléatoire — ne modélise NI sa structure \
+interne NI sa longueur. Ancre-toi sur la DÉCORATION autour d'elle (mots/lettres de préfixe \
+comme INV, FAC, F, N°, et les séparateurs / - espace) et sur l'endroit où la référence se \
+termine (un délimiteur ou la fin de chaîne), puis capture ce qui se trouve entre les deux \
+comme un jeton opaque.
+
+Règles de contenu :
+- Une seule regex, avec un groupe nommé (?P<ref>...) autour de la référence UNIQUEMENT — \
+exclus la décoration telle que 'INV/' ou un 'F' collé en tête qui ne fait pas partie de la référence.
+- Capture de façon générique, ex. (?P<ref>[A-Z0-9]+), bornée par l'ancre et le délimiteur ; \
+ne code jamais en dur les valeurs des exemples.
+- Le groupe capturé doit être STRICTEMENT égal à la référence donnée. Note la différence : \
+libellé 'F12345' réf '12345' (le F est une ancre, PAS une partie de la réf) contre libellé \
+'INV/FAC1234' réf 'FAC1234' (les lettres font partie de la réf).
+
+Règles de FORMAT (impératif, sinon la regex est inutilisable) :
+- Renvoie le motif BRUT, tel quel pour re.compile : PAS de préfixe r, PAS de guillemets \
+autour, PAS d'échappement de littéral de chaîne (écris \\d, pas \\\\d), PAS de bloc de code.
+- Le motif est déjà compilé avec re.IGNORECASE : n'émets AUCUN drapeau global en ligne — \
+ni (?i), ni (?s), ni (?m). Les groupes à portée locale comme (?i:FAC) restent autorisés.
+- Évite (?s)/DOTALL et les .* gourmands ; préfère \\b et des séparateurs explicites.
+
+Réponds en plaçant le motif entre <regex> et </regex>, puis une ligne d'explication entre \
+<why> et </why>. Rien d'autre."""
